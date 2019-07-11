@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -219,6 +220,88 @@ func (pool *Pool) Get(queues ...string) (*Job, error) {
 	return &job, nil
 }
 
+// GetMulti returns multi job from a highest priority
+// queue possible (left-to-right priority).
+func (pool *Pool) GetMulti(count int, queues ...string) ([]*Job, error) {
+	if count == 0 {
+		return nil, errors.New("expected at least one queue")
+	}
+
+	if len(queues) == 0 {
+		return nil, errors.New("expected at least one queue")
+	}
+
+	args := []interface{}{
+		"GETJOB",
+		"COUNT",
+		count,
+		"TIMEOUT",
+		int(pool.conf.Timeout.Nanoseconds() / 1000000),
+		"WITHCOUNTERS",
+		"FROM",
+	}
+	for _, arg := range queues {
+		args = append(args, arg)
+	}
+
+	reply, err := pool.do(args)
+	if err != nil {
+		return nil, err
+	}
+
+	replyArr, ok := reply.([]interface{})
+	if !ok || len(replyArr) == 0 {
+		return nil, errors.New("unexpected reply arr")
+	}
+
+	jobs := []*Job{}
+	for _, job := range replyArr {
+		res, err := serializeJob(job.([]interface{}))
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, res)
+	}
+	return jobs, nil
+}
+
+func serializeJob(arr []interface{}) (*Job, error) {
+	if len(arr) != 7 {
+		return nil, errors.New("unexpected reply")
+	}
+
+	job := Job{}
+
+	if bytes, ok := arr[0].([]byte); ok {
+		job.Queue = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: queue")
+	}
+
+	if bytes, ok := arr[1].([]byte); ok {
+		job.ID = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: id")
+	}
+
+	if bytes, ok := arr[2].([]byte); ok {
+		job.Data = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: data")
+	}
+
+	var ok bool
+	if job.Nacks, ok = arr[4].(int64); !ok {
+		return nil, errors.New("unexpected reply: nacks")
+	}
+
+	if job.AdditionalDeliveries, ok = arr[6].(int64); !ok {
+		return nil, errors.New("unexpected reply: additional-deliveries")
+	}
+
+	return &job, nil
+}
+
 // Fetch finds the job by its id and return its details
 func (pool *Pool) Fetch(ID string) (*Job, error) {
 	sess := pool.redis.Get()
@@ -378,4 +461,97 @@ func (pool *Pool) ActiveLen(queue string) (int, error) {
 		return 0, errors.New("unexpected reply #2")
 	}
 	return len(jobs), nil
+}
+
+type QueueScanResult struct {
+	Cursor     int
+	QueueNames []string
+}
+
+func (pool *Pool) QueueScanAll(count, minlen, maxlen, rate int) ([]string, error) {
+	cursor := 0
+	queueNames := []string{}
+	for {
+		res, err := pool.QueueScan(cursor, count, minlen, maxlen, rate)
+		if err != nil {
+			return nil, err
+		}
+		queueNames = append(queueNames, res.QueueNames...)
+
+		if res.Cursor == 0 {
+			break
+		}
+		cursor = res.Cursor
+	}
+	return queueNames, nil
+}
+
+func (pool *Pool) QueueScan(cursor, count, minlen, maxlen, rate int) (*QueueScanResult, error) {
+	sess := pool.redis.Get()
+	defer sess.Close()
+
+	args := []interface{}{"QSCAN"}
+
+	if cursor > 0 {
+		args = append(args, cursor)
+	}
+
+	if count > 0 {
+		args = append(args, "COUNT")
+		args = append(args, count)
+	}
+
+	if minlen > 0 {
+		args = append(args, "MINLEN")
+		args = append(args, minlen)
+	}
+
+	if maxlen > 0 {
+		args = append(args, "MAXLEN")
+		args = append(args, maxlen)
+	}
+
+	if rate > 0 {
+		args = append(args, "IMPORTRATE")
+		args = append(args, rate)
+	}
+
+	reply, err := pool.do(args)
+	if err != nil {
+		return nil, err
+	}
+
+	replyArr, ok := reply.([]interface{})
+	if !ok || len(replyArr) == 0 {
+		return nil, errors.New("unexpected reply arr")
+	}
+
+	res := &QueueScanResult{}
+
+	b, ok := replyArr[0].([]byte)
+	if !ok {
+		return nil, errors.New("unexpected reply: job count")
+	}
+	c, err := strconv.Atoi(string(b))
+	if err != nil {
+		return nil, err
+	}
+	res.Cursor = c
+
+	items, ok := replyArr[1].([]interface{})
+	if !ok {
+		return nil, errors.New("unexpected reply: queue names")
+	}
+
+	queueNames := []string{}
+	for _, item := range items {
+		queueName, ok := item.([]byte)
+		if !ok {
+			return nil, errors.New("unexpected reply: queue name")
+		}
+		queueNames = append(queueNames, string(queueName))
+	}
+	res.QueueNames = queueNames
+
+	return res, nil
 }
