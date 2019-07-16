@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
@@ -378,4 +379,97 @@ func (pool *Pool) ActiveLen(queue string) (int, error) {
 		return 0, errors.New("unexpected reply #2")
 	}
 	return len(jobs), nil
+}
+
+type QueueScanResult struct {
+	Cursor     int
+	QueueNames []string
+}
+
+func (pool *Pool) QueueScanAll(count, minlen, maxlen, rate int) ([]string, error) {
+	cursor := 0
+	queueNames := []string{}
+	for {
+		res, err := pool.QueueScan(cursor, count, minlen, maxlen, rate)
+		if err != nil {
+			return nil, err
+		}
+		queueNames = append(queueNames, res.QueueNames...)
+
+		if res.Cursor == 0 {
+			break
+		}
+		cursor = res.Cursor
+	}
+	return queueNames, nil
+}
+
+func (pool *Pool) QueueScan(cursor, count, minlen, maxlen, rate int) (*QueueScanResult, error) {
+	sess := pool.redis.Get()
+	defer sess.Close()
+
+	args := []interface{}{"QSCAN"}
+
+	if cursor > 0 {
+		args = append(args, cursor)
+	}
+
+	if count > 0 {
+		args = append(args, "COUNT")
+		args = append(args, count)
+	}
+
+	if minlen > 0 {
+		args = append(args, "MINLEN")
+		args = append(args, minlen)
+	}
+
+	if maxlen > 0 {
+		args = append(args, "MAXLEN")
+		args = append(args, maxlen)
+	}
+
+	if rate > 0 {
+		args = append(args, "IMPORTRATE")
+		args = append(args, rate)
+	}
+
+	reply, err := pool.do(args)
+	if err != nil {
+		return nil, err
+	}
+
+	replyArr, ok := reply.([]interface{})
+	if !ok || len(replyArr) == 0 {
+		return nil, errors.New("unexpected reply arr")
+	}
+
+	res := &QueueScanResult{}
+
+	b, ok := replyArr[0].([]byte)
+	if !ok {
+		return nil, errors.New("unexpected reply: job count")
+	}
+	c, err := strconv.Atoi(string(b))
+	if err != nil {
+		return nil, err
+	}
+	res.Cursor = c
+
+	items, ok := replyArr[1].([]interface{})
+	if !ok {
+		return nil, errors.New("unexpected reply: queue names")
+	}
+
+	queueNames := []string{}
+	for _, item := range items {
+		queueName, ok := item.([]byte)
+		if !ok {
+			return nil, errors.New("unexpected reply: queue name")
+		}
+		queueNames = append(queueNames, string(queueName))
+	}
+	res.QueueNames = queueNames
+
+	return res, nil
 }
