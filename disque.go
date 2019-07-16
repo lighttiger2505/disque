@@ -219,6 +219,88 @@ func (pool *Pool) Get(queues ...string) (*Job, error) {
 	return &job, nil
 }
 
+// GetMulti returns multi job from a highest priority
+// queue possible (left-to-right priority).
+func (pool *Pool) GetMulti(count int, queues ...string) ([]*Job, error) {
+	if count == 0 {
+		return nil, errors.New("expected at least one queue")
+	}
+
+	if len(queues) == 0 {
+		return nil, errors.New("expected at least one queue")
+	}
+
+	args := []interface{}{
+		"GETJOB",
+		"COUNT",
+		count,
+		"TIMEOUT",
+		int(pool.conf.Timeout.Nanoseconds() / 1000000),
+		"WITHCOUNTERS",
+		"FROM",
+	}
+	for _, arg := range queues {
+		args = append(args, arg)
+	}
+
+	reply, err := pool.do(args)
+	if err != nil {
+		return nil, err
+	}
+
+	replyArr, ok := reply.([]interface{})
+	if !ok || len(replyArr) == 0 {
+		return nil, errors.New("unexpected reply arr")
+	}
+
+	jobs := []*Job{}
+	for _, job := range replyArr {
+		res, err := serializeJob(job.([]interface{}))
+		if err != nil {
+			return nil, err
+		}
+		jobs = append(jobs, res)
+	}
+	return jobs, nil
+}
+
+func serializeJob(arr []interface{}) (*Job, error) {
+	if len(arr) != 7 {
+		return nil, errors.New("unexpected reply")
+	}
+
+	job := Job{}
+
+	if bytes, ok := arr[0].([]byte); ok {
+		job.Queue = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: queue")
+	}
+
+	if bytes, ok := arr[1].([]byte); ok {
+		job.ID = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: id")
+	}
+
+	if bytes, ok := arr[2].([]byte); ok {
+		job.Data = string(bytes)
+	} else {
+		return nil, errors.New("unexpected reply: data")
+	}
+
+	var ok bool
+	if job.Nacks, ok = arr[4].(int64); !ok {
+		return nil, errors.New("unexpected reply: nacks")
+	}
+
+	if job.AdditionalDeliveries, ok = arr[6].(int64); !ok {
+		return nil, errors.New("unexpected reply: additional-deliveries")
+	}
+
+	return &job, nil
+}
+
 // Fetch finds the job by its id and return its details
 func (pool *Pool) Fetch(ID string) (*Job, error) {
 	sess := pool.redis.Get()
